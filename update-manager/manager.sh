@@ -19,10 +19,13 @@ VESKTOP_LAUNCHER="/usr/bin/vesktop"
 
 PNPM="$HOME/.local/share/pnpm/bin/pnpm"
 
-# Check Git remotes at most once every 30 minutes.
-CHECK_INTERVAL=1800
+UPSTREAM_REMOTE="upstream"
+UPSTREAM_BRANCH="main"
 
-# How long to wait for Vesktop to close after SIGTERM.
+FORK_REMOTE="origin"
+FORK_BRANCH="main"
+
+CHECK_INTERVAL=1800
 VESKTOP_CLOSE_TIMEOUT=30
 
 # ============================================================
@@ -45,17 +48,14 @@ fail() {
     return 1
 }
 
-# Check dependencies before using flock.
 for command in git flock notify-send awk xargs; do
     command -v "$command" >/dev/null 2>&1 ||
         die "Required command not found: $command"
 done
 
-# Prevent overlapping manager instances.
 exec 9>"$LOCK"
 flock -n 9 || exit 0
 
-# Validate the installation.
 [[ -d "$REPO/.git" ]] ||
     die "Vencord checkout not found at $REPO"
 
@@ -73,6 +73,12 @@ flock -n 9 || exit 0
 
 command -v systemd-run >/dev/null 2>&1 ||
     die "systemd-run was not found."
+
+git -C "$REPO" remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 ||
+    die "Git remote '$UPSTREAM_REMOTE' is missing."
+
+git -C "$REPO" remote get-url "$FORK_REMOTE" >/dev/null 2>&1 ||
+    die "Git remote '$FORK_REMOTE' is missing."
 
 # ============================================================
 # Persistent state
@@ -95,11 +101,9 @@ load_plugins() {
     local line url name existing
 
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Ignore comments and blank lines.
         line="${line%%#*}"
         [[ "$line" =~ [^[:space:]] ]] || continue
 
-        # Each entry must contain URL|directory.
         [[ "$line" == *"|"* ]] || {
             fail "Invalid plugin entry: $line"
             return 1
@@ -140,7 +144,6 @@ load_plugins() {
 # Vesktop process detection and shutdown
 # ============================================================
 
-# Find only the main Vesktop process, not Electron helpers.
 vesktop_pids() {
     local proc first
 
@@ -160,7 +163,6 @@ vesktop_running() {
     [[ -n "$(vesktop_pids)" ]]
 }
 
-# Request a normal shutdown and wait. Never force-kill Vesktop.
 close_vesktop() {
     local pid elapsed
 
@@ -176,7 +178,6 @@ close_vesktop() {
             log "Vesktop closed successfully."
             return 0
         fi
-
         sleep 1
     done
 
@@ -184,8 +185,6 @@ close_vesktop() {
     return 1
 }
 
-# Launch Vesktop in its own user systemd service so it survives
-# the update-manager service exiting.
 launch_vesktop() {
     log "Launching Vesktop."
 
@@ -218,71 +217,137 @@ plugin_default_branch() {
 }
 
 # ============================================================
+# Vencord repository validation
+# ============================================================
+
+validate_vencord_checkout() {
+    local current
+
+    current="$(git -C "$REPO" branch --show-current)"
+
+    [[ "$current" == "main" ]] || {
+        fail "Vencord is on branch '$current', not main."
+        return 1
+    }
+
+    if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]]; then
+        fail "Vencord has tracked local changes. Commit or discard them before updating."
+        return 1
+    fi
+
+    if [[ -n "$(git -C "$REPO" rev-parse --verify MERGE_HEAD 2>/dev/null || true)" ]]; then
+        fail "Vencord has an unfinished Git merge. Resolve or abort it before updating."
+        return 1
+    fi
+}
+
+fetch_vencord_remotes() {
+    log "Fetching official Vencord from upstream."
+
+    git -C "$REPO" fetch --prune "$UPSTREAM_REMOTE" || {
+        fail "Could not fetch official Vencord."
+        return 1
+    }
+
+    log "Fetching personal fork from origin."
+
+    git -C "$REPO" fetch --prune "$FORK_REMOTE" || {
+        fail "Could not fetch personal fork."
+        return 1
+    }
+
+    git -C "$REPO" show-ref --verify --quiet \
+        "refs/remotes/$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" || {
+        fail "Official upstream/main does not exist."
+        return 1
+    }
+
+    git -C "$REPO" show-ref --verify --quiet \
+        "refs/remotes/$FORK_REMOTE/$FORK_BRANCH" || {
+        fail "Personal origin/main does not exist."
+        return 1
+    }
+}
+
+# Merge a remote branch without rewriting history.
+# Conflicts are aborted so the repository is not left mid-merge.
+merge_remote_branch() {
+    local remote_branch="$1"
+    local description="$2"
+
+    if git -C "$REPO" merge-base --is-ancestor "$remote_branch" HEAD; then
+        log "$description is already included in local main."
+        return 0
+    fi
+
+    log "Integrating $description."
+
+    if git -C "$REPO" merge-base --is-ancestor HEAD "$remote_branch"; then
+        git -C "$REPO" merge --ff-only "$remote_branch" || {
+            fail "Could not fast-forward to $description."
+            return 1
+        }
+    else
+        if ! git -C "$REPO" merge --no-edit "$remote_branch"; then
+            log "Merge conflict while integrating $description; aborting merge."
+            git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+            fail "Could not merge $description. No force-push was attempted."
+            return 1
+        fi
+    fi
+}
+
+# ============================================================
 # Check repositories for updates
 # ============================================================
 
-# Prints "yes" or "no".
 check_for_updates() {
     local now last path url name branch current
     local found=no
     local i
+    local upstream_ref fork_ref
 
     load_plugins || return 1
+    validate_vencord_checkout || return 1
 
     now="$(date +%s)"
     last="$(cat "$LAST_ATTEMPT" 2>/dev/null || printf '0')"
 
-    # Treat invalid timestamps as zero.
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
 
-    # Throttle successful AND failed remote checks.
     if ((now >= last && now - last < CHECK_INTERVAL)); then
         printf 'no\n'
         return 0
     fi
 
-    # Match the original upgrade.sh: switch to main before updating.
-    git -C "$REPO" checkout main || {
-        fail "Could not switch Vencord to main."
-        return 1
-    }
-
-    # Permit the existing local upgrade.sh modification only.
-    if ! git -C "$REPO" status --porcelain --untracked-files=no |
-        awk '$2 != "upgrade.sh" { bad=1 } END { exit bad }'; then
-        fail "Vencord has tracked local changes other than upgrade.sh."
-        return 1
-    fi
-
-    if ! git -C "$REPO" diff --cached --quiet -- upgrade.sh; then
-        fail "upgrade.sh has staged changes; unstage them before updating."
-        return 1
-    fi
-
-    # Record the attempt before network operations.
-    # This prevents repeated fetches when GitHub is unavailable.
     printf '%s\n' "$now" >"$LAST_ATTEMPT"
 
-    log "Checking Vencord origin/main."
+    log "Checking official upstream and personal fork."
 
-    git -C "$REPO" fetch --prune origin || {
-        fail "Could not fetch Vencord origin."
-        return 1
-    }
+    fetch_vencord_remotes || return 1
 
-    git -C "$REPO" show-ref --verify --quiet refs/remotes/origin/main || {
-        fail "Vencord origin/main does not exist."
-        return 1
-    }
+    upstream_ref="$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"
+    fork_ref="$FORK_REMOTE/$FORK_BRANCH"
 
-    # Any commits on origin/main that are not in HEAD mean an update is
-    # available. Divergence is left to the same git pull strategy used by
-    # the original upgrade.sh.
-    if [[ "$(git -C "$REPO" rev-list --count HEAD..origin/main)" -gt 0 ]]; then
+    # Official commits not yet integrated into local main.
+    if ! git -C "$REPO" merge-base --is-ancestor "$upstream_ref" HEAD; then
         found=yes
+        log "Official Vencord has commits not yet integrated."
     fi
 
-    # Check every configured plugin.
+    # Personal fork commits not yet integrated locally.
+    if ! git -C "$REPO" merge-base --is-ancestor "$fork_ref" HEAD; then
+        found=yes
+        log "Personal fork has commits not yet integrated locally."
+    fi
+
+    # Local commits not yet published to the personal fork.
+    if [[ "$(git -C "$REPO" rev-list --count "$fork_ref..HEAD")" -gt 0 ]]; then
+        found=yes
+        log "Local main has commits not yet pushed to the personal fork."
+    fi
+
+    # Check configured plugins.
     for i in "${!PLUGIN_URLS[@]}"; do
         url="${PLUGIN_URLS[$i]}"
         name="${PLUGIN_NAMES[$i]}"
@@ -336,9 +401,7 @@ check_for_updates() {
         }
 
         if [[ "$(git -C "$path" rev-parse HEAD)" != "$(git -C "$path" rev-parse "origin/$branch")" ]]; then
-
-            if git -C "$path" merge-base --is-ancestor \
-                HEAD "origin/$branch"; then
+            if git -C "$path" merge-base --is-ancestor HEAD "origin/$branch"; then
                 found=yes
             else
                 fail "Plugin $name has diverged from origin/$branch."
@@ -359,41 +422,17 @@ apply_updates() {
     local i
 
     load_plugins || return 1
+    validate_vencord_checkout || return 1
 
-    # Match the original upgrade.sh: switch to main before updating.
-    git -C "$REPO" checkout main || {
-        fail "Could not switch Vencord to main."
-        return 1
-    }
+    fetch_vencord_remotes || return 1
 
-    if ! git -C "$REPO" status --porcelain --untracked-files=no |
-        awk '$2 != "upgrade.sh" { bad=1 } END { exit bad }'; then
-        fail "Vencord has tracked local changes."
-        return 1
-    fi
-
-    if ! git -C "$REPO" diff --cached --quiet -- upgrade.sh; then
-        fail "upgrade.sh has staged changes; unstage them before updating."
-        return 1
-    fi
-
-    # Fetch Vencord.
-    log "Fetching Vencord from origin."
-
-    git -C "$REPO" fetch --prune origin || {
-        fail "Could not fetch Vencord."
-        return 1
-    }
-
-    # Fetch and validate every installed plugin before changing refs.
+    # Validate installed plugins before changing repositories.
     for i in "${!PLUGIN_URLS[@]}"; do
         url="${PLUGIN_URLS[$i]}"
         name="${PLUGIN_NAMES[$i]}"
         path="$REPO/src/userplugins/$name"
 
-        if [[ ! -e "$path" ]]; then
-            continue
-        fi
+        [[ -e "$path" ]] || continue
 
         [[ -d "$path" ]] || {
             fail "Plugin path is not a directory: $path."
@@ -432,9 +471,7 @@ apply_updates() {
             return 1
         }
 
-        if ! git -C "$path" merge-base --is-ancestor \
-            HEAD "origin/$branch"; then
-
+        if ! git -C "$path" merge-base --is-ancestor HEAD "origin/$branch"; then
             if [[ "$(git -C "$path" rev-parse HEAD)" != "$(git -C "$path" rev-parse "origin/$branch")" ]]; then
                 fail "Plugin $name cannot be updated with a fast-forward."
                 return 1
@@ -442,11 +479,22 @@ apply_updates() {
         fi
     done
 
-    # All installed repositories passed validation.
-    log "Updating Vencord."
+    # Integrate commits already present on your personal fork.
+    merge_remote_branch \
+        "$FORK_REMOTE/$FORK_BRANCH" \
+        "$FORK_REMOTE/$FORK_BRANCH" || return 1
 
-    git -C "$REPO" pull origin main || {
-        fail "Could not pull Vencord from origin/main."
+    # Integrate the latest official Vencord commits.
+    merge_remote_branch \
+        "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" \
+        "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" || return 1
+
+    # Publish the synchronised branch to your personal fork.
+    # Never force-push.
+    log "Pushing synchronised main to personal fork."
+
+    git -C "$REPO" push "$FORK_REMOTE" "main:$FORK_BRANCH" || {
+        fail "Could not push synchronised main to personal fork."
         return 1
     }
 
@@ -479,7 +527,7 @@ apply_updates() {
         }
     done
 
-    # Build Vencord, as in the original upgrade.sh.
+    # Build Vencord.
     cd "$REPO"
 
     log "Building Vencord."
@@ -489,7 +537,7 @@ apply_updates() {
         return 1
     }
 
-    log "Update and build completed successfully."
+    log "Update, fork synchronisation, and build completed successfully."
     return 0
 }
 
@@ -510,7 +558,7 @@ ask_user() {
             --action=do=Do it \
             --action=later=Later \
             "Vencord updates available" \
-            "Updates are ready. Choose Do it to close Vesktop, update and build, or Later to wait until Vesktop is closed."
+            "Official Vencord or a configured plugin has updates. Choose Do it to close Vesktop, synchronise, update and build, or Later to wait until Vesktop is closed."
     )" || action=""
 
     case "$action" in
@@ -523,7 +571,6 @@ ask_user() {
         log "User selected Later."
         ;;
     *)
-        # No explicit choice: ask again on the next timer run.
         write_pending "undecided"
         log "No action selected; leaving decision undecided."
         ;;
@@ -541,7 +588,6 @@ process_pending() {
 
     case "$decision" in
     later)
-        # Later means wait until Vesktop is closed naturally.
         if vesktop_running; then
             log "Update deferred; Vesktop is still running."
             return 0
@@ -554,20 +600,18 @@ process_pending() {
             notify-send \
                 --app-name="Vencord Update Manager" \
                 "Vencord update complete" \
-                "Updates were installed and Vencord was built."
+                "Official Vencord, your fork, and configured plugins were synchronised and Vencord was built."
         else
             write_pending "undecided"
             notify-send \
                 --app-name="Vencord Update Manager" \
                 --urgency=normal \
                 "Vencord update failed" \
-                "The update or build failed. Check the manager log before retrying."
+                "The update, fork synchronisation, or build failed. Check the manager log before retrying."
         fi
         ;;
 
     do)
-        # Do it means close Vesktop gracefully, update, build,
-        # then relaunch it.
         if vesktop_running && ! close_vesktop; then
             write_pending "do"
 
@@ -601,12 +645,11 @@ process_pending() {
                 --app-name="Vencord Update Manager" \
                 --urgency=normal \
                 "Vencord update failed" \
-                "The update or build failed. Check the manager log before retrying."
+                "The update, fork synchronisation, or build failed. Check the manager log before retrying."
         fi
         ;;
 
     undecided)
-        # Ask once, then process only an explicit choice.
         ask_user
         decision="$(cat "$PENDING" 2>/dev/null || true)"
 
