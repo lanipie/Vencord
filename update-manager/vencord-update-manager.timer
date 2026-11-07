@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic Vencord Update Check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=vencord-update-manager.service
+
+[Install]
+WantedBy=timers.target

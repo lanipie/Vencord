@@ -1,0 +1,7 @@
+[Unit]
+Description=Vencord Update Manager
+
+[Service]
+Type=oneshot
+ExecStart=%h/git/Vencord/update-manager/manager.sh
+TimeoutStartSec=infinity
