@@ -555,7 +555,7 @@ ask_user() {
             --app-name="Vencord Update Manager" \
             --urgency=normal \
             --wait \
-            --action=do=Do it \
+            --action=do="Do it" \
             --action=later=Later \
             "Vencord updates available" \
             "Official Vencord or a configured plugin has updates. Choose Do it to close Vesktop, synchronise, update and build, or Later to wait until Vesktop is closed."
