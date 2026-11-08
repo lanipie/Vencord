@@ -153,10 +153,10 @@ vesktop_pids() {
         executable=$(readlink -f "$proc/exe" 2>/dev/null) || continue
         [[ "$executable" == "$VESKTOP_EXE" ]] || continue
 
-        cmdline=$(tr '\\0' ' ' < "$proc/cmdline" 2>/dev/null) || continue
+        cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null) || continue
         [[ "$cmdline" == *"--type="* ]] && continue
 
-        printf '%s\\n' "${proc##*/}"
+        printf '%s\n' "${proc##*/}"
     done
 }
 
