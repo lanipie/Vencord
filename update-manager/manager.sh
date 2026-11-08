@@ -145,17 +145,18 @@ load_plugins() {
 # ============================================================
 
 vesktop_pids() {
-    local proc first
+    local proc
+    local -a args
 
     for proc in /proc/[0-9]*; do
         [[ -r "$proc/cmdline" ]] || continue
+        args=()
+        mapfile -d '' -t args < "$proc/cmdline" 2>/dev/null || true
 
-        first=""
-        IFS= read -r -d '' first <"$proc/cmdline" || true
+        [[ "${args[0]-}" == "$VESKTOP_EXE" ]] || continue
+        [[ "${args[1]-}" == --type=* ]] && continue
 
-        if [[ "$first" == "$VESKTOP_EXE" ]]; then
-            printf '%s\n' "${proc##*/}"
-        fi
+        printf '%s\n' "${proc##*/}"
     done
 }
 
@@ -170,23 +171,26 @@ close_vesktop() {
 
     while read -r pid; do
         [[ -n "$pid" ]] || continue
+        log "Sending SIGTERM to Vesktop main process $pid."
         kill -TERM "$pid" 2>/dev/null || true
     done < <(vesktop_pids)
 
     for ((elapsed = 0; elapsed < VESKTOP_CLOSE_TIMEOUT; elapsed++)); do
         if ! vesktop_running; then
-            log "Vesktop closed successfully."
+            log "Vesktop main process exited successfully."
             return 0
         fi
         sleep 1
     done
 
-    log "Vesktop did not close within ${VESKTOP_CLOSE_TIMEOUT} seconds."
+    log "ERROR: Vesktop did not exit within ${VESKTOP_CLOSE_TIMEOUT} seconds."
     return 1
 }
 
 launch_vesktop() {
-    log "Launching Vesktop."
+    local elapsed
+
+    log "Starting Vesktop."
 
     systemd-run \
         --user \
@@ -194,10 +198,23 @@ launch_vesktop() {
         --collect \
         --quiet \
         --no-block \
-        "$VESKTOP_LAUNCHER"
+        "$VESKTOP_EXE" --disable-hdr || {
+            log "ERROR: Could not start the Vesktop launcher."
+            return 1
+        }
+
+    for ((elapsed = 0; elapsed < 20; elapsed++)); do
+        if vesktop_running; then
+            log "Vesktop main process detected. Relaunch successful."
+            return 0
+        fi
+        sleep 1
+    done
+
+    log "ERROR: Vesktop did not start within 20 seconds."
+    return 1
 }
 
-# ============================================================
 # Plugin default branch detection
 # ============================================================
 
