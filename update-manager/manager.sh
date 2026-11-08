@@ -171,8 +171,8 @@ close_vesktop() {
 
     while read -r pid; do
         [[ -n "$pid" ]] || continue
-        log "Sending SIGTERM to Vesktop main process $pid."
-        kill -TERM "$pid" 2>/dev/null || true
+        log "Sending SIGINT to Vesktop main process $pid."
+        kill -INT "$pid" 2>/dev/null || true
     done < <(vesktop_pids)
 
     for ((elapsed = 0; elapsed < VESKTOP_CLOSE_TIMEOUT; elapsed++)); do
