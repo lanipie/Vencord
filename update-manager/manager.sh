@@ -145,18 +145,18 @@ load_plugins() {
 # ============================================================
 
 vesktop_pids() {
-    local proc
-    local -a args
+    local proc executable cmdline
 
     for proc in /proc/[0-9]*; do
-        [[ -r "$proc/cmdline" ]] || continue
-        args=()
-        mapfile -d '' -t args < "$proc/cmdline" 2>/dev/null || true
+        [[ -r "$proc/cmdline" && -e "$proc/exe" ]] || continue
 
-        [[ "${args[0]-}" == "$VESKTOP_EXE" ]] || continue
-        [[ "${args[1]-}" == --type=* ]] && continue
+        executable=$(readlink -f "$proc/exe" 2>/dev/null) || continue
+        [[ "$executable" == "$VESKTOP_EXE" ]] || continue
 
-        printf '%s\n' "${proc##*/}"
+        cmdline=$(tr '\\0' ' ' < "$proc/cmdline" 2>/dev/null) || continue
+        [[ "$cmdline" == *"--type="* ]] && continue
+
+        printf '%s\\n' "${proc##*/}"
     done
 }
 
