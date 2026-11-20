@@ -17,7 +17,7 @@ LOCK="$STATE/manager.lock"
 VESKTOP_EXE="/usr/lib/vesktop/vesktop"
 VESKTOP_LAUNCHER="/usr/bin/vesktop"
 
-PNPM="$HOME/.local/share/pnpm/bin/pnpm"
+PNPM="$HOME/.local/bin/pnpm"
 
 UPSTREAM_REMOTE="upstream"
 UPSTREAM_BRANCH="main"
